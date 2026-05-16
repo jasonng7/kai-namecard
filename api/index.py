@@ -21,6 +21,7 @@ from _shared import (
     list_scans,
     parse_drive_folder_id,
     refresh_google_access_token,
+    source_fingerprint,
     unix_filename_stamp,
     upsert_drive_connection,
     verify_state,
@@ -64,6 +65,14 @@ INDEX_HTML = """
       .metric span { color: #657184; font-size: 13px; }
       .message { min-height: 44px; padding: 12px 0; color: #657184; }
       .message.error { color: #b42318; }
+      .progress-card { display: grid; grid-template-columns: 42px 1fr; gap: 12px; align-items: center; border: 1px solid #d9e0ea; border-radius: 8px; padding: 14px; margin-bottom: 16px; background: #f7f9fc; }
+      .progress-card.hidden { display: none; }
+      .spinner { width: 30px; height: 30px; border: 3px solid #c9d4e1; border-top-color: #0f766e; border-radius: 50%; animation: spin .9s linear infinite; }
+      .progress-title { display: flex; justify-content: space-between; gap: 12px; color: #354052; font-size: 14px; font-weight: 700; }
+      .progress-track { height: 8px; border-radius: 999px; overflow: hidden; background: #dfe6ee; margin-top: 8px; }
+      .progress-fill { width: 0%; height: 100%; background: #0f766e; transition: width .25s ease; }
+      .progress-detail { margin-top: 6px; color: #657184; font-size: 13px; overflow-wrap: anywhere; }
+      @keyframes spin { to { transform: rotate(360deg); } }
       table { width: 100%; border-collapse: collapse; table-layout: fixed; }
       th, td { border-bottom: 1px solid #d9e0ea; padding: 11px 8px; text-align: left; vertical-align: top; overflow-wrap: anywhere; font-size: 14px; }
       th { color: #354052; background: #f7f9fc; font-weight: 700; }
@@ -110,6 +119,17 @@ INDEX_HTML = """
             <div class="metric"><strong id="failedMetric">0</strong><span>Failed</span></div>
           </div>
           <div id="message" class="message">Ready.</div>
+          <div id="progressCard" class="progress-card hidden">
+            <div class="spinner" aria-hidden="true"></div>
+            <div>
+              <div class="progress-title">
+                <span id="progressLabel">Preparing sync</span>
+                <span id="progressCount">0 / 0</span>
+              </div>
+              <div class="progress-track"><div id="progressFill" class="progress-fill"></div></div>
+              <div id="progressDetail" class="progress-detail">Checking Google Drive folder...</div>
+            </div>
+          </div>
           <div id="results" class="empty">No scans loaded yet.</div>
         </section>
       </div>
@@ -129,6 +149,11 @@ INDEX_HTML = """
         skippedMetric: document.getElementById("skippedMetric"),
         failedMetric: document.getElementById("failedMetric"),
         message: document.getElementById("message"),
+        progressCard: document.getElementById("progressCard"),
+        progressLabel: document.getElementById("progressLabel"),
+        progressCount: document.getElementById("progressCount"),
+        progressFill: document.getElementById("progressFill"),
+        progressDetail: document.getElementById("progressDetail"),
         results: document.getElementById("results"),
       };
       const workspaceKey = "kai-namecard-workspace-id";
@@ -136,6 +161,15 @@ INDEX_HTML = """
       if (!workspaceId) { workspaceId = crypto.randomUUID(); localStorage.setItem(workspaceKey, workspaceId); }
       function setMessage(text, isError = false) { els.message.textContent = text; els.message.classList.toggle("error", isError); }
       function setBusy(isBusy) { [els.connectButton, els.refreshButton, els.syncButton, els.exportButton].forEach((b) => b.disabled = isBusy); }
+      function setProgress({ visible = true, label = "Preparing sync", current = 0, total = 0, detail = "" }) {
+        els.progressCard.classList.toggle("hidden", !visible);
+        if (!visible) return;
+        const percent = total > 0 ? Math.round((current / total) * 100) : 0;
+        els.progressLabel.textContent = label;
+        els.progressCount.textContent = `${current} / ${total}`;
+        els.progressFill.style.width = `${Math.min(100, Math.max(0, percent))}%`;
+        els.progressDetail.textContent = detail;
+      }
       function escapeHtml(value) { return String(value).replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&#039;"); }
       async function fetchJson(url, options) { const response = await fetch(url, options); const data = await response.json(); if (!response.ok) throw new Error(data.error || "Request failed."); return data; }
       function renderRows(rows) {
@@ -169,12 +203,80 @@ INDEX_HTML = """
       });
       els.syncButton.addEventListener("click", async () => {
         try {
-          setBusy(true); setMessage("Scanning Drive folder. This can take a little while for large folders.");
-          const data = await fetchJson("/api/sync", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ workspace_id: workspaceId, folder: els.folderInput.value, force: els.forceInput.checked }) });
-          els.foundMetric.textContent = data.found; els.processedMetric.textContent = data.processed.length; els.skippedMetric.textContent = data.skipped.length; els.failedMetric.textContent = data.failed.length;
-          renderRows([...data.processed, ...data.skipped]); setMessage(`Synced ${data.folder_name || "Drive folder"}.`);
+          setBusy(true);
+          setMessage("Checking Drive folder before scanning...");
+          setProgress({ label: "Checking folder", current: 0, total: 0, detail: "Listing images and checking the scan cache." });
+          els.foundMetric.textContent = "0";
+          els.processedMetric.textContent = "0";
+          els.skippedMetric.textContent = "0";
+          els.failedMetric.textContent = "0";
+
+          const plan = await fetchJson("/api/drive_files", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ workspace_id: workspaceId, folder: els.folderInput.value, force: els.forceInput.checked }),
+          });
+          const skipped = plan.files
+            .filter((file) => file.cached)
+            .map((file) => ({ file_id: file.id, file_name: file.name, reason: "already_scanned", extraction: file.extraction }));
+          const toProcess = plan.files.filter((file) => !file.cached);
+          const processed = [];
+          const failed = [];
+
+          els.foundMetric.textContent = plan.found;
+          els.skippedMetric.textContent = skipped.length;
+          renderRows([...processed, ...skipped]);
+
+          if (!toProcess.length) {
+            setProgress({ label: "Sync complete", current: plan.found, total: plan.found, detail: "No new name cards found. Already scanned cards were skipped." });
+            setMessage(`Synced ${plan.folder_name || "Drive folder"}. No new cards to scan.`);
+            return;
+          }
+
+          for (let index = 0; index < toProcess.length; index += 1) {
+            const file = toProcess[index];
+            setMessage(`Scanning ${index + 1} of ${toProcess.length} new card(s).`);
+            setProgress({
+              label: "Scanning new cards",
+              current: index,
+              total: toProcess.length,
+              detail: `Reading ${file.name}`,
+            });
+
+            const result = await fetchJson("/api/process_file", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                workspace_id: workspaceId,
+                folder_id: plan.folder_id,
+                file_id: file.id,
+                force: els.forceInput.checked,
+              }),
+            });
+
+            if (result.status === "skipped") {
+              skipped.push({ file_id: result.file_id, file_name: result.file_name, reason: "already_scanned", extraction: result.extraction });
+            } else if (result.status === "processed") {
+              processed.push({ file_id: result.file_id, file_name: result.file_name, extraction: result.extraction });
+            } else {
+              failed.push({ file_id: result.file_id, file_name: result.file_name, error: result.error || "Unknown processing error" });
+            }
+
+            els.processedMetric.textContent = processed.length;
+            els.skippedMetric.textContent = skipped.length;
+            els.failedMetric.textContent = failed.length;
+            renderRows([...processed, ...skipped]);
+            setProgress({
+              label: "Scanning new cards",
+              current: index + 1,
+              total: toProcess.length,
+              detail: `${file.name} complete`,
+            });
+          }
+
+          setMessage(`Synced ${plan.folder_name || "Drive folder"}. ${processed.length} new, ${skipped.length} skipped, ${failed.length} failed.`);
         } catch (error) { setMessage(error.message, true); }
-        finally { setBusy(false); }
+        finally { setBusy(false); setTimeout(() => setProgress({ visible: false }), 1400); }
       });
       els.exportButton.addEventListener("click", () => { window.location.href = `/api/export?workspace_id=${encodeURIComponent(workspaceId)}`; });
       (async function boot() { try { await checkStatus(); await loadScans(); setMessage("Ready."); } catch (error) { setMessage(error.message, true); } })();
@@ -261,6 +363,124 @@ def status(workspace_id: str):
         return error_response(exc)
 
 
+def drive_context(workspace_id, folder_input=None):
+    if not workspace_id:
+        raise RuntimeError("workspace_id is required.")
+
+    connection = get_drive_connection(workspace_id)
+    if not connection:
+        raise RuntimeError("Connect Google Drive before syncing.")
+
+    folder_id = parse_drive_folder_id(folder_input) if folder_input else None
+    access_token = refresh_google_access_token(connection["refresh_token"])
+    return access_token, folder_id
+
+
+@app.post("/api/drive_files")
+async def drive_files(request: Request):
+    try:
+        body = await request.json()
+        workspace_id = body.get("workspace_id")
+        folder_input = body.get("folder")
+        force = bool(body.get("force"))
+
+        access_token, folder_id = drive_context(workspace_id, folder_input)
+        folder = get_drive_file(access_token, folder_id, "id,name,mimeType,webViewLink")
+        if folder.get("mimeType") != "application/vnd.google-apps.folder":
+            raise RuntimeError("The Drive link must point to a folder.")
+
+        files = list_drive_images(access_token, folder_id)
+        enriched_files = []
+        for file_info in files:
+            fingerprint = source_fingerprint(file_info)
+            existing = None if force else find_existing_scan(workspace_id, fingerprint)
+            enriched_files.append(
+                {
+                    "id": file_info["id"],
+                    "name": file_info["name"],
+                    "mime_type": file_info.get("mimeType"),
+                    "modified_time": file_info.get("modifiedTime"),
+                    "size": file_info.get("size"),
+                    "cached": bool(existing),
+                    "extraction": existing.get("extraction") if existing else None,
+                }
+            )
+
+        return {
+            "folder_id": folder_id,
+            "folder_name": folder.get("name"),
+            "found": len(files),
+            "files": enriched_files,
+        }
+    except Exception as exc:
+        return error_response(exc)
+
+
+@app.post("/api/process_file")
+async def process_file(request: Request):
+    try:
+        body = await request.json()
+        workspace_id = body.get("workspace_id")
+        folder_id = body.get("folder_id")
+        file_id = body.get("file_id")
+        force = bool(body.get("force"))
+        if not workspace_id:
+            raise RuntimeError("workspace_id is required.")
+        if not folder_id or not file_id:
+            raise RuntimeError("folder_id and file_id are required.")
+
+        access_token, _ = drive_context(workspace_id)
+        folder = get_drive_file(access_token, folder_id, "id,name,mimeType")
+        if folder.get("mimeType") != "application/vnd.google-apps.folder":
+            raise RuntimeError("The Drive link must point to a folder.")
+
+        file_info = get_drive_file(
+            access_token,
+            file_id,
+            "id,name,mimeType,modifiedTime,md5Checksum,size,parents,webViewLink",
+        )
+        if folder_id not in file_info.get("parents", []):
+            raise RuntimeError("That file is not inside the selected Drive folder.")
+
+        fingerprint = source_fingerprint(file_info)
+        existing = None if force else find_existing_scan(workspace_id, fingerprint)
+        if existing:
+            return {
+                "status": "skipped",
+                "file_id": file_info["id"],
+                "file_name": file_info["name"],
+                "reason": "already_scanned",
+                "extraction": existing["extraction"],
+            }
+
+        try:
+            image_bytes = download_drive_file(access_token, file_info["id"])
+            extraction = extract_card_from_bytes(image_bytes, file_info["mimeType"])
+            row = insert_scan(
+                workspace_id,
+                folder_id,
+                folder.get("name"),
+                file_info,
+                fingerprint,
+                extraction,
+            )
+            return {
+                "status": "processed",
+                "file_id": file_info["id"],
+                "file_name": file_info["name"],
+                "extraction": row["extraction"],
+            }
+        except Exception as exc:
+            return {
+                "status": "failed",
+                "file_id": file_info.get("id"),
+                "file_name": file_info.get("name"),
+                "error": str(exc),
+            }
+    except Exception as exc:
+        return error_response(exc)
+
+
 @app.post("/api/sync")
 async def sync(request: Request):
     try:
@@ -287,8 +507,6 @@ async def sync(request: Request):
         failed = []
 
         for file_info in files:
-            from _shared import source_fingerprint
-
             fingerprint = source_fingerprint(file_info)
             existing = None if force else find_existing_scan(workspace_id, fingerprint)
             if existing:
