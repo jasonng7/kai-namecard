@@ -1,0 +1,8 @@
+.DS_Store
+.env
+__pycache__/
+*.pyc
+.vercel/
+Namecards/
+namecard_database.json
+.vercel
