@@ -50,6 +50,7 @@ INDEX_HTML = """
       button, input { font: inherit; }
       button { min-height: 42px; border: 1px solid #0f766e; background: #0f766e; color: #fff; padding: 0 16px; border-radius: 8px; cursor: pointer; white-space: nowrap; }
       button.secondary { background: #fff; color: #115e59; }
+      button.icon-button { width: 38px; min-height: 38px; padding: 0; border-radius: 999px; background: #fff; color: #115e59; font-weight: 800; line-height: 1; }
       button:disabled { cursor: not-allowed; opacity: .55; }
       input[type="text"] { width: 100%; min-height: 42px; border: 1px solid #d9e0ea; border-radius: 8px; background: #f7f9fc; color: #17202a; padding: 0 12px; }
       label { display: block; margin: 12px 0 6px; color: #354052; font-size: 14px; font-weight: 650; }
@@ -59,6 +60,8 @@ INDEX_HTML = """
       .panel, .metric { border: 1px solid #d9e0ea; border-radius: 8px; background: #fff; }
       .panel { padding: 18px; }
       .panel + .panel { margin-top: 14px; }
+      .panel-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+      .panel-heading h2 { margin: 0; }
       .actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 14px; }
       .check-row { display: flex; align-items: center; gap: 8px; margin-top: 12px; color: #657184; font-size: 14px; }
       .summary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-bottom: 16px; }
@@ -85,6 +88,13 @@ INDEX_HTML = """
       th { color: #354052; background: #f7f9fc; font-weight: 700; }
       .empty { border: 1px dashed #d9e0ea; border-radius: 8px; padding: 28px; color: #657184; text-align: center; }
       .tag { display: inline-flex; min-height: 24px; align-items: center; padding: 0 8px; border-radius: 999px; background: #f3f5f8; color: #526071; font-size: 12px; }
+      .modal-backdrop { position: fixed; inset: 0; display: grid; place-items: center; padding: 18px; background: rgba(15, 23, 42, .42); z-index: 20; }
+      .modal-backdrop.hidden { display: none; }
+      .modal { width: min(420px, 100%); border-radius: 8px; background: #fff; border: 1px solid #d9e0ea; box-shadow: 0 18px 50px rgba(15, 23, 42, .18); padding: 18px; }
+      .modal h2 { margin: 0 0 8px; font-size: 20px; }
+      .modal p { margin: 0; }
+      .modal ul { margin: 10px 0 0; padding-left: 18px; color: #526071; line-height: 1.5; }
+      .modal-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 18px; }
       @media (max-width: 820px) { header, .workflow { display: block; } header .status { margin-top: 18px; } aside { margin-bottom: 18px; } .summary { grid-template-columns: repeat(2, minmax(0, 1fr)); } table { min-width: 760px; } .table-wrap { overflow-x: auto; } }
     </style>
   </head>
@@ -108,7 +118,10 @@ INDEX_HTML = """
             </div>
           </div>
           <div class="panel">
-            <h2>Folder Sync</h2>
+            <div class="panel-heading">
+              <h2>Folder Sync</h2>
+              <button id="infoButton" class="icon-button secondary" type="button" title="How to use">i</button>
+            </div>
             <label for="folderInput">Drive folder link or ID</label>
             <input id="folderInput" type="text" placeholder="https://drive.google.com/drive/folders/..." />
             <label class="check-row"><input id="skipProcessedInput" type="checkbox" checked /> Skip processed namecard</label>
@@ -143,12 +156,23 @@ INDEX_HTML = """
         </section>
       </div>
     </main>
+    <div id="modalBackdrop" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+      <div class="modal">
+        <h2 id="modalTitle">Confirm</h2>
+        <div id="modalBody"></div>
+        <div class="modal-actions">
+          <button id="modalCancelButton" class="secondary" type="button">Cancel</button>
+          <button id="modalOkButton" type="button">OK</button>
+        </div>
+      </div>
+    </div>
     <script>
       const els = {
         connectionStatus: document.getElementById("connectionStatus"),
         connectionText: document.getElementById("connectionText"),
         connectButton: document.getElementById("connectButton"),
         refreshButton: document.getElementById("refreshButton"),
+        infoButton: document.getElementById("infoButton"),
         syncButton: document.getElementById("syncButton"),
         fullRescanButton: document.getElementById("fullRescanButton"),
         exportButton: document.getElementById("exportButton"),
@@ -166,12 +190,48 @@ INDEX_HTML = """
         progressFill: document.getElementById("progressFill"),
         progressDetail: document.getElementById("progressDetail"),
         results: document.getElementById("results"),
+        modalBackdrop: document.getElementById("modalBackdrop"),
+        modalTitle: document.getElementById("modalTitle"),
+        modalBody: document.getElementById("modalBody"),
+        modalCancelButton: document.getElementById("modalCancelButton"),
+        modalOkButton: document.getElementById("modalOkButton"),
       };
       const workspaceKey = "kai-namecard-workspace-id";
       let workspaceId = localStorage.getItem(workspaceKey);
       if (!workspaceId) { workspaceId = crypto.randomUUID(); localStorage.setItem(workspaceKey, workspaceId); }
       function setMessage(text, isError = false) { els.message.textContent = text; els.message.classList.toggle("error", isError); }
-      function setBusy(isBusy) { [els.connectButton, els.refreshButton, els.syncButton, els.fullRescanButton, els.exportButton].forEach((b) => b.disabled = isBusy); }
+      function setBusy(isBusy) { [els.connectButton, els.refreshButton, els.infoButton, els.syncButton, els.fullRescanButton, els.exportButton].forEach((b) => b.disabled = isBusy); }
+      function openModal({ title, body, okText = "OK", cancelText = "Cancel", showCancel = true }) {
+        return new Promise((resolve) => {
+          els.modalTitle.textContent = title;
+          els.modalBody.innerHTML = body;
+          els.modalOkButton.textContent = okText;
+          els.modalCancelButton.textContent = cancelText;
+          els.modalCancelButton.style.display = showCancel ? "" : "none";
+          els.modalBackdrop.classList.remove("hidden");
+          const cleanup = (value) => {
+            els.modalBackdrop.classList.add("hidden");
+            els.modalOkButton.onclick = null;
+            els.modalCancelButton.onclick = null;
+            els.modalBackdrop.onclick = null;
+            resolve(value);
+          };
+          els.modalOkButton.onclick = () => cleanup(true);
+          els.modalCancelButton.onclick = () => cleanup(false);
+          els.modalBackdrop.onclick = (event) => {
+            if (event.target === els.modalBackdrop) cleanup(false);
+          };
+        });
+      }
+      function confirmSync({ fullRescan }) {
+        return openModal({
+          title: fullRescan ? "Full Rescan?" : "Sync Folder?",
+          body: fullRescan
+            ? "<p>This removes deleted Drive files from the database and OCRs every current card again.</p>"
+            : "<p>This checks Drive, skips processed cards, and OCRs only new cards.</p>",
+          okText: fullRescan ? "Full Rescan" : "Sync",
+        });
+      }
       function hideMismatch() { els.mismatchPanel.classList.add("hidden"); els.mismatchPanel.innerHTML = ""; }
       function showMismatch(files) {
         const shown = files.slice(0, 8);
@@ -222,6 +282,14 @@ INDEX_HTML = """
         try { setBusy(true); await checkStatus(); await loadScans(); setMessage("Status refreshed."); }
         catch (error) { setMessage(error.message, true); }
         finally { setBusy(false); }
+      });
+      els.infoButton.addEventListener("click", async () => {
+        await openModal({
+          title: "How to Use",
+          body: "<ul><li>Connect Google Drive.</li><li>Paste a Drive folder link.</li><li>Use Sync Folder for new cards only.</li><li>Use Full Rescan after deleting or replacing cards.</li><li>Export Excel when done.</li></ul>",
+          okText: "Got it",
+          showCancel: false,
+        });
       });
       async function runFolderSync({ skipProcessed }) {
         try {
@@ -321,10 +389,14 @@ INDEX_HTML = """
         finally { setBusy(false); setTimeout(() => setProgress({ visible: false }), 1400); }
       }
       els.syncButton.addEventListener("click", async () => {
-        await runFolderSync({ skipProcessed: els.skipProcessedInput.checked });
+        if (await confirmSync({ fullRescan: false })) {
+          await runFolderSync({ skipProcessed: els.skipProcessedInput.checked });
+        }
       });
       els.fullRescanButton.addEventListener("click", async () => {
-        await runFolderSync({ skipProcessed: false });
+        if (await confirmSync({ fullRescan: true })) {
+          await runFolderSync({ skipProcessed: false });
+        }
       });
       els.exportButton.addEventListener("click", () => { window.location.href = `/api/export?workspace_id=${encodeURIComponent(workspaceId)}`; });
       (async function boot() { try { await checkStatus(); await loadScans(); setMessage("Ready."); } catch (error) { setMessage(error.message, true); } })();
