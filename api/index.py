@@ -12,6 +12,7 @@ from _shared import (
     exchange_oauth_code,
     extract_card_from_bytes,
     fetch_google_email,
+    find_deleted_folder_scans,
     find_existing_scan,
     get_drive_connection,
     get_drive_file,
@@ -20,6 +21,7 @@ from _shared import (
     list_drive_images,
     list_scans,
     parse_drive_folder_id,
+    prune_deleted_folder_scans,
     refresh_google_access_token,
     source_fingerprint,
     unix_filename_stamp,
@@ -65,6 +67,11 @@ INDEX_HTML = """
       .metric span { color: #657184; font-size: 13px; }
       .message { min-height: 44px; padding: 12px 0; color: #657184; }
       .message.error { color: #b42318; }
+      .mismatch { border: 1px solid #f3bf72; border-radius: 8px; padding: 14px; margin-bottom: 16px; background: #fff8ed; color: #593b00; }
+      .mismatch.hidden { display: none; }
+      .mismatch strong { display: block; margin-bottom: 6px; color: #3f2a00; }
+      .mismatch ul { margin: 8px 0 0; padding-left: 18px; }
+      .mismatch li { margin: 4px 0; overflow-wrap: anywhere; }
       .progress-card { display: grid; grid-template-columns: 42px 1fr; gap: 12px; align-items: center; border: 1px solid #d9e0ea; border-radius: 8px; padding: 14px; margin-bottom: 16px; background: #f7f9fc; }
       .progress-card.hidden { display: none; }
       .spinner { width: 30px; height: 30px; border: 3px solid #c9d4e1; border-top-color: #0f766e; border-radius: 50%; animation: spin .9s linear infinite; }
@@ -107,6 +114,7 @@ INDEX_HTML = """
             <label class="check-row"><input id="skipProcessedInput" type="checkbox" checked /> Skip processed namecard</label>
             <div class="actions">
               <button id="syncButton">Sync Folder</button>
+              <button id="fullRescanButton" class="secondary">Full Rescan</button>
               <button id="exportButton" class="secondary">Export Excel</button>
             </div>
           </div>
@@ -119,6 +127,7 @@ INDEX_HTML = """
             <div class="metric"><strong id="failedMetric">0</strong><span>Failed</span></div>
           </div>
           <div id="message" class="message">Ready.</div>
+          <div id="mismatchPanel" class="mismatch hidden"></div>
           <div id="progressCard" class="progress-card hidden">
             <div class="spinner" aria-hidden="true"></div>
             <div>
@@ -141,6 +150,7 @@ INDEX_HTML = """
         connectButton: document.getElementById("connectButton"),
         refreshButton: document.getElementById("refreshButton"),
         syncButton: document.getElementById("syncButton"),
+        fullRescanButton: document.getElementById("fullRescanButton"),
         exportButton: document.getElementById("exportButton"),
         folderInput: document.getElementById("folderInput"),
         skipProcessedInput: document.getElementById("skipProcessedInput"),
@@ -149,6 +159,7 @@ INDEX_HTML = """
         skippedMetric: document.getElementById("skippedMetric"),
         failedMetric: document.getElementById("failedMetric"),
         message: document.getElementById("message"),
+        mismatchPanel: document.getElementById("mismatchPanel"),
         progressCard: document.getElementById("progressCard"),
         progressLabel: document.getElementById("progressLabel"),
         progressCount: document.getElementById("progressCount"),
@@ -160,7 +171,18 @@ INDEX_HTML = """
       let workspaceId = localStorage.getItem(workspaceKey);
       if (!workspaceId) { workspaceId = crypto.randomUUID(); localStorage.setItem(workspaceKey, workspaceId); }
       function setMessage(text, isError = false) { els.message.textContent = text; els.message.classList.toggle("error", isError); }
-      function setBusy(isBusy) { [els.connectButton, els.refreshButton, els.syncButton, els.exportButton].forEach((b) => b.disabled = isBusy); }
+      function setBusy(isBusy) { [els.connectButton, els.refreshButton, els.syncButton, els.fullRescanButton, els.exportButton].forEach((b) => b.disabled = isBusy); }
+      function hideMismatch() { els.mismatchPanel.classList.add("hidden"); els.mismatchPanel.innerHTML = ""; }
+      function showMismatch(files) {
+        const shown = files.slice(0, 8);
+        const extra = files.length > shown.length ? `<li>${files.length - shown.length} more deleted file(s)</li>` : "";
+        els.mismatchPanel.innerHTML = `
+          <strong>Database and Drive folder do not match.</strong>
+          <div>These saved scans no longer exist in the current Drive folder. Use Full Rescan to remove them from the database and rebuild from the current folder.</div>
+          <ul>${shown.map((file) => `<li>${escapeHtml(file.file_name || file.file_id || "Deleted Drive file")}</li>`).join("")}${extra}</ul>
+        `;
+        els.mismatchPanel.classList.remove("hidden");
+      }
       function setProgress({ visible = true, label = "Preparing sync", current = 0, total = 0, detail = "" }) {
         els.progressCard.classList.toggle("hidden", !visible);
         if (!visible) return;
@@ -201,11 +223,12 @@ INDEX_HTML = """
         catch (error) { setMessage(error.message, true); }
         finally { setBusy(false); }
       });
-      els.syncButton.addEventListener("click", async () => {
+      async function runFolderSync({ skipProcessed }) {
         try {
           setBusy(true);
-          setMessage("Checking Drive folder before scanning...");
-          setProgress({ label: "Checking folder", current: 0, total: 0, detail: "Listing images and checking the scan cache." });
+          hideMismatch();
+          setMessage(skipProcessed ? "Checking Drive folder before scanning..." : "Preparing full rescan from current Drive files...");
+          setProgress({ label: "Checking folder", current: 0, total: 0, detail: "Listing images and comparing Drive against the database." });
           els.foundMetric.textContent = "0";
           els.processedMetric.textContent = "0";
           els.skippedMetric.textContent = "0";
@@ -214,8 +237,20 @@ INDEX_HTML = """
           const plan = await fetchJson("/api/drive_files", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ workspace_id: workspaceId, folder: els.folderInput.value, skip_processed: els.skipProcessedInput.checked }),
+            body: JSON.stringify({
+              workspace_id: workspaceId,
+              folder: els.folderInput.value,
+              skip_processed: skipProcessed,
+              cleanup_deleted: !skipProcessed,
+            }),
           });
+          if (plan.mismatch_count > 0 && skipProcessed) {
+            showMismatch(plan.mismatch_files || []);
+            els.foundMetric.textContent = plan.found;
+            setProgress({ label: "Mismatch found", current: 0, total: plan.found, detail: "Review deleted Drive files before scanning." });
+            setMessage(`${plan.mismatch_count} saved scan(s) are missing from the Drive folder. Click Full Rescan to clean them up and scan the current folder.`, true);
+            return;
+          }
           const skipped = plan.files
             .filter((file) => file.cached)
             .map((file) => ({ file_id: file.id, file_name: file.name, reason: "already_scanned", extraction: file.extraction }));
@@ -226,10 +261,13 @@ INDEX_HTML = """
           els.foundMetric.textContent = plan.found;
           els.skippedMetric.textContent = skipped.length;
           renderRows([...processed, ...skipped]);
+          if (plan.cleaned_count > 0) {
+            setMessage(`Removed ${plan.cleaned_count} deleted Drive file(s) from the saved scans.`);
+          }
 
           if (!toProcess.length) {
             setProgress({ label: "Sync complete", current: plan.found, total: plan.found, detail: "No new name cards found. Already scanned cards were skipped." });
-            setMessage(`Synced ${plan.folder_name || "Drive folder"}. No new cards to scan.`);
+            setMessage(`Synced ${plan.folder_name || "Drive folder"}. No new cards to scan.${plan.cleaned_count ? ` Removed ${plan.cleaned_count} deleted file(s).` : ""}`);
             return;
           }
 
@@ -250,7 +288,7 @@ INDEX_HTML = """
                 workspace_id: workspaceId,
                 folder_id: plan.folder_id,
                 file_id: file.id,
-                skip_processed: els.skipProcessedInput.checked,
+                skip_processed: skipProcessed,
               }),
             });
 
@@ -274,9 +312,19 @@ INDEX_HTML = """
             });
           }
 
-          setMessage(`Synced ${plan.folder_name || "Drive folder"}. ${processed.length} new, ${skipped.length} skipped, ${failed.length} failed.`);
-        } catch (error) { setMessage(error.message, true); }
+          setMessage(`Synced ${plan.folder_name || "Drive folder"}. ${processed.length} scanned, ${skipped.length} skipped, ${failed.length} failed.${plan.cleaned_count ? ` Removed ${plan.cleaned_count} deleted file(s).` : ""}`);
+          await loadScans();
+        } catch (error) {
+          const extra = /not found|deleted|moved/i.test(error.message) ? " Try Full Rescan to refresh the folder from Drive." : "";
+          setMessage(`${error.message}${extra}`, true);
+        }
         finally { setBusy(false); setTimeout(() => setProgress({ visible: false }), 1400); }
+      }
+      els.syncButton.addEventListener("click", async () => {
+        await runFolderSync({ skipProcessed: els.skipProcessedInput.checked });
+      });
+      els.fullRescanButton.addEventListener("click", async () => {
+        await runFolderSync({ skipProcessed: false });
       });
       els.exportButton.addEventListener("click", () => { window.location.href = `/api/export?workspace_id=${encodeURIComponent(workspaceId)}`; });
       (async function boot() { try { await checkStatus(); await loadScans(); setMessage("Ready."); } catch (error) { setMessage(error.message, true); } })();
@@ -383,6 +431,7 @@ async def drive_files(request: Request):
         workspace_id = body.get("workspace_id")
         folder_input = body.get("folder")
         skip_processed = bool(body.get("skip_processed", True))
+        cleanup_deleted = bool(body.get("cleanup_deleted", False))
 
         access_token, folder_id = drive_context(workspace_id, folder_input)
         folder = get_drive_file(access_token, folder_id, "id,name,mimeType,webViewLink")
@@ -390,6 +439,13 @@ async def drive_files(request: Request):
             raise RuntimeError("The Drive link must point to a folder.")
 
         files = list_drive_images(access_token, folder_id)
+        current_file_ids = [file_info["id"] for file_info in files]
+        mismatch_scans = find_deleted_folder_scans(workspace_id, folder_id, current_file_ids)
+        cleaned_scans = (
+            prune_deleted_folder_scans(workspace_id, folder_id, current_file_ids)
+            if cleanup_deleted
+            else []
+        )
         enriched_files = []
         for file_info in files:
             fingerprint = source_fingerprint(file_info)
@@ -410,6 +466,22 @@ async def drive_files(request: Request):
             "folder_id": folder_id,
             "folder_name": folder.get("name"),
             "found": len(files),
+            "mismatch_count": len(mismatch_scans),
+            "mismatch_files": [
+                {
+                    "file_id": scan.get("drive_file_id"),
+                    "file_name": scan.get("drive_file_name"),
+                }
+                for scan in mismatch_scans
+            ],
+            "cleaned_count": len(cleaned_scans),
+            "cleaned_files": [
+                {
+                    "file_id": scan.get("drive_file_id"),
+                    "file_name": scan.get("drive_file_name"),
+                }
+                for scan in cleaned_scans
+            ],
             "files": enriched_files,
         }
     except Exception as exc:
@@ -488,6 +560,7 @@ async def sync(request: Request):
         workspace_id = body.get("workspace_id")
         folder_input = body.get("folder")
         skip_processed = bool(body.get("skip_processed", True))
+        cleanup_deleted = bool(body.get("cleanup_deleted", False))
         if not workspace_id:
             raise RuntimeError("workspace_id is required.")
 
@@ -502,6 +575,13 @@ async def sync(request: Request):
             raise RuntimeError("The Drive link must point to a folder.")
 
         files = list_drive_images(access_token, folder_id)
+        current_file_ids = [file_info["id"] for file_info in files]
+        mismatch_scans = find_deleted_folder_scans(workspace_id, folder_id, current_file_ids)
+        cleaned_scans = (
+            prune_deleted_folder_scans(workspace_id, folder_id, current_file_ids)
+            if cleanup_deleted
+            else []
+        )
         processed = []
         skipped = []
         failed = []
@@ -551,6 +631,8 @@ async def sync(request: Request):
             "folder_id": folder_id,
             "folder_name": folder.get("name"),
             "found": len(files),
+            "mismatch_count": len(mismatch_scans),
+            "cleaned_count": len(cleaned_scans),
             "processed": processed,
             "skipped": skipped,
             "failed": failed,

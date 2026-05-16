@@ -243,6 +243,10 @@ def get_drive_file(access_token, file_id, fields):
         timeout=30,
     )
     if response.status_code >= 400:
+        if response.status_code == 404:
+            raise RuntimeError(
+                "Drive file was not found. It may have been deleted or moved. Use Full Rescan to refresh this folder."
+            )
         raise RuntimeError(f"Google Drive metadata error: {response.text}")
     return response.json()
 
@@ -347,6 +351,43 @@ def list_scans(workspace_id):
             "order": "processed_at.asc",
         },
     )
+
+
+def list_folder_scans(workspace_id, folder_id):
+    return supabase_request(
+        "GET",
+        "namecard_scans",
+        params={
+            "workspace_id": f"eq.{workspace_id}",
+            "drive_folder_id": f"eq.{folder_id}",
+            "select": "id,drive_file_id,drive_file_name",
+        },
+    )
+
+
+def find_deleted_folder_scans(workspace_id, folder_id, current_drive_file_ids):
+    current_ids = set(current_drive_file_ids)
+    return [
+        scan
+        for scan in list_folder_scans(workspace_id, folder_id)
+        if scan.get("drive_file_id") not in current_ids
+    ]
+
+
+def delete_scan(scan_id):
+    supabase_request(
+        "DELETE",
+        "namecard_scans",
+        params={"id": f"eq.{scan_id}"},
+        prefer="return=minimal",
+    )
+
+
+def prune_deleted_folder_scans(workspace_id, folder_id, current_drive_file_ids):
+    stale_scans = find_deleted_folder_scans(workspace_id, folder_id, current_drive_file_ids)
+    for scan in stale_scans:
+        delete_scan(scan["id"])
+    return stale_scans
 
 
 def extract_card_from_bytes(image_bytes, mime_type):
