@@ -104,7 +104,7 @@ INDEX_HTML = """
             <h2>Folder Sync</h2>
             <label for="folderInput">Drive folder link or ID</label>
             <input id="folderInput" type="text" placeholder="https://drive.google.com/drive/folders/..." />
-            <label class="check-row"><input id="forceInput" type="checkbox" /> Rescan even if cached</label>
+            <label class="check-row"><input id="skipProcessedInput" type="checkbox" checked /> Skip processed namecard</label>
             <div class="actions">
               <button id="syncButton">Sync Folder</button>
               <button id="exportButton" class="secondary">Export Excel</button>
@@ -143,7 +143,7 @@ INDEX_HTML = """
         syncButton: document.getElementById("syncButton"),
         exportButton: document.getElementById("exportButton"),
         folderInput: document.getElementById("folderInput"),
-        forceInput: document.getElementById("forceInput"),
+        skipProcessedInput: document.getElementById("skipProcessedInput"),
         foundMetric: document.getElementById("foundMetric"),
         processedMetric: document.getElementById("processedMetric"),
         skippedMetric: document.getElementById("skippedMetric"),
@@ -214,7 +214,7 @@ INDEX_HTML = """
           const plan = await fetchJson("/api/drive_files", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ workspace_id: workspaceId, folder: els.folderInput.value, force: els.forceInput.checked }),
+            body: JSON.stringify({ workspace_id: workspaceId, folder: els.folderInput.value, skip_processed: els.skipProcessedInput.checked }),
           });
           const skipped = plan.files
             .filter((file) => file.cached)
@@ -250,7 +250,7 @@ INDEX_HTML = """
                 workspace_id: workspaceId,
                 folder_id: plan.folder_id,
                 file_id: file.id,
-                force: els.forceInput.checked,
+                skip_processed: els.skipProcessedInput.checked,
               }),
             });
 
@@ -382,7 +382,7 @@ async def drive_files(request: Request):
         body = await request.json()
         workspace_id = body.get("workspace_id")
         folder_input = body.get("folder")
-        force = bool(body.get("force"))
+        skip_processed = bool(body.get("skip_processed", True))
 
         access_token, folder_id = drive_context(workspace_id, folder_input)
         folder = get_drive_file(access_token, folder_id, "id,name,mimeType,webViewLink")
@@ -393,7 +393,7 @@ async def drive_files(request: Request):
         enriched_files = []
         for file_info in files:
             fingerprint = source_fingerprint(file_info)
-            existing = None if force else find_existing_scan(workspace_id, fingerprint)
+            existing = find_existing_scan(workspace_id, fingerprint) if skip_processed else None
             enriched_files.append(
                 {
                     "id": file_info["id"],
@@ -423,7 +423,7 @@ async def process_file(request: Request):
         workspace_id = body.get("workspace_id")
         folder_id = body.get("folder_id")
         file_id = body.get("file_id")
-        force = bool(body.get("force"))
+        skip_processed = bool(body.get("skip_processed", True))
         if not workspace_id:
             raise RuntimeError("workspace_id is required.")
         if not folder_id or not file_id:
@@ -443,7 +443,7 @@ async def process_file(request: Request):
             raise RuntimeError("That file is not inside the selected Drive folder.")
 
         fingerprint = source_fingerprint(file_info)
-        existing = None if force else find_existing_scan(workspace_id, fingerprint)
+        existing = find_existing_scan(workspace_id, fingerprint) if skip_processed else None
         if existing:
             return {
                 "status": "skipped",
@@ -487,7 +487,7 @@ async def sync(request: Request):
         body = await request.json()
         workspace_id = body.get("workspace_id")
         folder_input = body.get("folder")
-        force = bool(body.get("force"))
+        skip_processed = bool(body.get("skip_processed", True))
         if not workspace_id:
             raise RuntimeError("workspace_id is required.")
 
@@ -508,7 +508,7 @@ async def sync(request: Request):
 
         for file_info in files:
             fingerprint = source_fingerprint(file_info)
-            existing = None if force else find_existing_scan(workspace_id, fingerprint)
+            existing = find_existing_scan(workspace_id, fingerprint) if skip_processed else None
             if existing:
                 skipped.append(
                     {
